@@ -107,16 +107,18 @@ php_needs_archive_repos() {
 }
 
 # Los paquetes de desarrollo y los flags de gd cambiaron en PHP 7.4.
+# La imagen de PHP 5.6 esta sobre Debian 9 (stretch), no sobre jessie: alli el
+# paquete de png ya es libpng-dev (libpng16), y libpng12-dev no existe.
 php_build_deps() {
     if [[ "$PHP_VERSION" == "5.6" ]]; then
-        printf 'libpng12-dev libjpeg-dev libfreetype6-dev zlib1g-dev'
+        printf 'libpng-dev libjpeg-dev libfreetype6-dev zlib1g-dev'
     else
         printf 'libpng-dev libjpeg-dev libfreetype6-dev libzip-dev libicu-dev libonig-dev'
     fi
 }
 
-# El metapaquete default-mysql-client no existe en Debian jessie, la base de la
-# imagen de PHP 5.6: alli el cliente todavia se llama mysql-client.
+# En Debian 9 (stretch), la base de la imagen de PHP 5.6, el cliente se sigue
+# llamando mysql-client; default-mysql-client llego despues.
 php_mysql_client_pkg() {
     if [[ "$PHP_VERSION" == "5.6" ]]; then
         printf 'mysql-client'
@@ -154,13 +156,21 @@ write_dockerfile() {
         printf 'FROM php:%s-%s\n\n' "$PHP_VERSION" "$base_tag"
 
         if php_needs_archive_repos; then
-            printf '# Debian archivo: los repositorios de esta version ya no estan en deb.debian.org.\n'
+            printf '# Repositorios de una version de Debian que puede estar ya archivada.\n'
+            printf '# No se da por hecho: se prueba el original y solo si falla se cambia a\n'
+            printf '# archive.debian.org. Bullseye (PHP 7.4) todavia responde hoy y dejara de\n'
+            printf '# hacerlo mas adelante; asi la imagen sigue construyendose igual.\n'
             printf 'RUN set -eux; \\\n'
-            printf '    sed -i -e "s|deb.debian.org|archive.debian.org|g" \\\n'
-            printf '           -e "s|security.debian.org|archive.debian.org|g" \\\n'
-            printf '           -e "/stretch-updates/d" -e "/buster-updates/d" -e "/jessie-updates/d" \\\n'
-            printf '           /etc/apt/sources.list; \\\n'
-            printf '    echo "Acquire::Check-Valid-Until false;" > /etc/apt/apt.conf.d/99no-check-valid\n\n'
+            printf '    if ! apt-get update -q; then \\\n'
+            printf '        sed -i -e "s|deb.debian.org|archive.debian.org|g" \\\n'
+            printf '               -e "s|security.debian.org|archive.debian.org|g" \\\n'
+            printf '               -e "/stretch-updates/d" -e "/buster-updates/d" \\\n'
+            printf '               -e "/jessie-updates/d" -e "/bullseye-updates/d" \\\n'
+            printf '               -e "s|^deb |deb [trusted=yes] |" \\\n'
+            printf '               /etc/apt/sources.list; \\\n'
+            printf '        echo "Acquire::Check-Valid-Until false;" > /etc/apt/apt.conf.d/99no-check-valid; \\\n'
+            printf '        apt-get update; \\\n'
+            printf '    fi\n\n'
         fi
 
         printf '# Dependencias de compilacion de las extensiones de PHP.\n'
@@ -397,12 +407,12 @@ case "${1:-}" in
     status)  docker compose ps ;;
     logs)    docker compose logs -f --tail 100 ${2:+"$2"} ;;
     shell)   docker compose exec "$(php_service)" bash ;;
-    db)      docker compose exec db sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD"' ;;
+    db)      docker compose exec db sh -c 'exec "$(command -v mariadb || command -v mysql)" -uroot -p"$MYSQL_ROOT_PASSWORD"' ;;
     backup)
         mkdir -p backups
         out="backups/${DB_NAME}-$(date +%Y%m%d-%H%M%S).sql.gz"
         docker compose exec -T db sh -c \
-            "exec mysqldump -uroot -p\"\$MYSQL_ROOT_PASSWORD\" --single-transaction --routines '${DB_NAME}'" \
+            "exec \"\$(command -v mariadb-dump || command -v mysqldump)\" -uroot -p\"\$MYSQL_ROOT_PASSWORD\" --single-transaction --routines '${DB_NAME}'" \
             | gzip > "$out"
         echo "Copia guardada en $out"
         ;;
@@ -412,9 +422,9 @@ case "${1:-}" in
         read -rp "Esto sobrescribe la base '${DB_NAME}'. Continuar? [s/N]: " a
         [[ "${a,,}" == "s" ]] || exit 0
         if [[ "$file" == *.gz ]]; then
-            gunzip -c "$file" | docker compose exec -T db sh -c "exec mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" '${DB_NAME}'"
+            gunzip -c "$file" | docker compose exec -T db sh -c "exec \"\$(command -v mariadb || command -v mysql)\" -uroot -p\"\$MYSQL_ROOT_PASSWORD\" '${DB_NAME}'"
         else
-            docker compose exec -T db sh -c "exec mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" '${DB_NAME}'" < "$file"
+            docker compose exec -T db sh -c "exec \"\$(command -v mariadb || command -v mysql)\" -uroot -p\"\$MYSQL_ROOT_PASSWORD\" '${DB_NAME}'" < "$file"
         fi
         echo "Restaurado."
         ;;

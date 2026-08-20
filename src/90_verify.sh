@@ -11,7 +11,26 @@ dc() {
 # Ejecuta un comando dentro de un servicio, sin TTY (para poder capturar salida).
 dexec() {
     local svc=$1; shift
-    dc exec -T "$svc" "$@"
+    # Sin '< /dev/null' el comando de dentro se queda con la entrada estandar.
+    # En un 'curl | bash' esa entrada es el propio script todavia sin leer.
+    dc exec -T "$svc" "$@" < /dev/null
+}
+
+# Comprueba que un proceso corre dentro de un servicio SIN depender de lo que
+# traiga la imagen: 'docker top' lee la tabla de procesos desde el host. En las
+# imagenes oficiales no se puede contar con 'pgrep': php:*-fpm no lo incluye, y
+# el de busybox (nginx:alpine) compara con la linea de comandos completa, asi
+# que 'pgrep -x nginx' no encuentra 'nginx: master process ...'.
+service_process() {
+    local svc=$1 pattern=$2 cid out
+    cid="$(dc ps -q "$svc" 2>/dev/null)" || return 1
+    [[ -n "$cid" ]] || return 1
+    # La tabla se guarda entera en vez de filtrarla con una tuberia: 'grep -q'
+    # cierra la salida en cuanto encuentra la linea, 'docker top' muere con
+    # SIGPIPE y con 'pipefail' la comprobacion falla a ratos aunque el proceso
+    # este perfectamente vivo.
+    out="$(docker top "$cid" 2>/dev/null)" || return 1
+    [[ "$out" == *"$pattern"* ]]
 }
 
 php_service_name() {
@@ -78,13 +97,13 @@ verify_services() {
     case "$WEB_ENGINE" in
         apache)
             check "Configuracion de Apache" dexec web apache2ctl -t || failed=1
-            check "Proceso apache2 en marcha" dexec web pgrep -x apache2 || failed=1
+            check "Proceso apache2 en marcha" service_process web apache2 || failed=1
             check "PHP ${PHP_VERSION} operativo" dexec web php -v || failed=1
             ;;
         nginx)
             check "Configuracion de Nginx" dexec web nginx -t || failed=1
-            check "Proceso nginx en marcha" dexec web pgrep -x nginx || failed=1
-            check "Proceso php-fpm en marcha" dexec php pgrep -f php-fpm || failed=1
+            check "Proceso nginx en marcha" service_process web nginx || failed=1
+            check "Proceso php-fpm en marcha" service_process php php-fpm || failed=1
             check "PHP ${PHP_VERSION} operativo" dexec php php -v || failed=1
             ;;
     esac
@@ -123,7 +142,7 @@ check() {
 db_query() {
     local sql=$1 database=${2:-}
     printf '%s\n' "$sql" | dc exec -T -e DEPLOYER_DB="$database" db sh -c \
-        'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" ${DEPLOYER_DB:+"$DEPLOYER_DB"} -N -B'
+        'exec "$(command -v mariadb || command -v mysql)" -uroot -p"$MYSQL_ROOT_PASSWORD" ${DEPLOYER_DB:+"$DEPLOYER_DB"} -N -B'
 }
 
 # Escapa un valor para meterlo entre comillas simples en una sentencia SQL. Las

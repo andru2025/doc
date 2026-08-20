@@ -60,9 +60,11 @@ grant_project_user() {
 # Ordenados por tamano: el volcado bueno casi siempre es el mas grande, y los
 # pequenos suelen ser migraciones sueltas o esquemas parciales.
 find_sql_files() {
+    # Que no haya volcados (o que 'find' se queje de un directorio) no es un
+    # fallo del despliegue: quien llama ya trata la lista vacia.
     find "$APP_DIR" -type f \( -iname '*.sql' -o -iname '*.sql.gz' \) \
         -not -path '*/vendor/*' -not -path '*/node_modules/*' -not -path '*/.git/*' \
-        -printf '%s\t%p\n' 2>/dev/null | sort -rn -k1,1 | cut -f2-
+        -printf '%s\t%p\n' 2>/dev/null | sort -rn -k1,1 | cut -f2- || true
 }
 
 human_size() {
@@ -139,7 +141,7 @@ import_sql_file() {
     # hay que hacerlo sobrevivir al entrecomillado del shell intermedio.
     local rc=0
     local -a mysql_run=(dc exec -T -e DEPLOYER_DB="$DB_NAME" db sh -c
-        'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --default-character-set=utf8mb4 "$DEPLOYER_DB"')
+        'exec "$(command -v mariadb || command -v mysql)" -uroot -p"$MYSQL_ROOT_PASSWORD" --default-character-set=utf8mb4 "$DEPLOYER_DB"')
 
     if [[ "$file" == *.gz ]]; then
         gunzip -c "$file" | "${mysql_run[@]}" || rc=$?
@@ -163,7 +165,9 @@ import_sql_file() {
 verify_import() {
     local tables rows
     local schema; schema="$(sql_quote "$DB_NAME")"
-    tables="$(db_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=${schema}" | tr -d '[:space:]')"
+    # Esto es una comprobacion, no un paso del despliegue: si la consulta falla
+    # se avisa, pero no se tira abajo una importacion que ya termino bien.
+    tables="$(db_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=${schema}" 2>/dev/null | tr -d '[:space:]' || true)"
 
     if [[ -z "$tables" || "$tables" == "0" ]]; then
         warn "La importacion termino sin errores pero la base '${DB_NAME}' no tiene ninguna tabla."

@@ -26,9 +26,11 @@ phase_fetch_source() {
     flatten_single_dir
     detect_docroot
 
+    # Solo es un dato informativo: si 'find' tropieza con un directorio sin
+    # permisos no tiene sentido abortar un despliegue que ya ha ido bien.
     local files
-    files="$(find "$APP_DIR" -type f | wc -l)"
-    ok "Proyecto descargado: ${files} archivos en ${APP_DIR}"
+    files="$(find "$APP_DIR" -type f 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+    ok "Proyecto descargado: ${files:-0} archivos en ${APP_DIR}"
 }
 
 fetch_from_git() {
@@ -117,7 +119,9 @@ detect_docroot() {
         candidates+=("$dir")
     done < <(find "$APP_DIR" -mindepth 2 -maxdepth 3 -name 'index.php' -type f 2>/dev/null | sort)
 
-    mapfile -t candidates < <(printf '%s\n' "${candidates[@]:-}" | grep -v '^$' | awk '!seen[$0]++')
+    # Con el array vacio 'grep -v' no encuentra nada y devuelve 1: no es un
+    # error, solo significa que no hay ningun candidato que deduplicar.
+    mapfile -t candidates < <(printf '%s\n' "${candidates[@]:-}" | grep -v '^$' | awk '!seen[$0]++' || true)
 
     if (( ${#candidates[@]} == 0 )); then
         warn "No encontre ningun index.php. Se servira la raiz del proyecto."

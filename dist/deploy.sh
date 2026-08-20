@@ -10,7 +10,7 @@
 #
 # NO EDITAR dist/deploy.sh A MANO: se genera con ./build.sh desde src/*.sh
 #
-# Generado por build.sh el 2026-08-20 20:54 UTC - no editar
+# Generado por build.sh el 2026-08-20 22:39 UTC - no editar
 set -Eeuo pipefail
 
 DEPLOYER_VERSION="1.0.0"
@@ -125,7 +125,11 @@ run() {
 detect_input() {
     if [[ -t 0 ]]; then
         TTY_IN=/dev/stdin
-    elif [[ -e /dev/tty ]] && (: >/dev/tty) 2>/dev/null; then
+    elif [[ -p /dev/stdin ]] && [[ -e /dev/tty ]] && (: >/dev/tty) 2>/dev/null; then
+        # Solo el caso 'curl | bash': stdin es una tuberia y el usuario sigue
+        # delante del terminal. Si stdin viene de /dev/null o de un fichero la
+        # intencion es un despliegue desatendido, y caer a /dev/tty dejaria el
+        # script colgado en la primera pregunta esperando a alguien que no esta.
         TTY_IN=/dev/tty
     else
         NONINTERACTIVE=1
@@ -427,13 +431,16 @@ phase_setup_docker() {
         # servicio no arranco al instalar la imagen del VPS.
         info "Docker esta instalado pero el demonio no responde. Intentando arrancarlo..."
         start_docker_daemon
-        docker_alive || die "El demonio de Docker no arranca. Revisa: systemctl status docker"
+        (( DRY_RUN )) || docker_alive || die "El demonio de Docker no arranca. Revisa: systemctl status docker"
         DOCKER_WAS_PRESENT=1
         ok "Demonio de Docker arrancado."
     else
         install_docker
         start_docker_daemon
-        docker_alive || die "Docker se instalo pero el demonio no responde. Revisa: systemctl status docker"
+        # En --dry-run no se ha instalado nada, asi que el demonio no puede
+        # responder: comprobarlo abortaria el simulacro en la fase 1 y las
+        # nueve fases restantes no llegarian a verse nunca.
+        (( DRY_RUN )) || docker_alive || die "Docker se instalo pero el demonio no responde. Revisa: systemctl status docker"
         ok "Docker instalado correctamente."
     fi
 
@@ -441,7 +448,7 @@ phase_setup_docker() {
         ok "Docker Compose disponible ($(docker compose version --short 2>/dev/null))."
     else
         install_compose_plugin
-        compose_alive || die "No se pudo instalar el plugin 'docker compose'."
+        (( DRY_RUN )) || compose_alive || die "No se pudo instalar el plugin 'docker compose'."
         ok "Plugin Docker Compose instalado."
     fi
 }
@@ -560,29 +567,35 @@ PORT_PMA_BASE=8180
 # Puertos publicados por contenedores Docker, incluidos los parados: un
 # contenedor detenido reclama su puerto en cuanto alguien lo arranca, asi que
 # ignorarlos provocaria un choque mas adelante.
+#
+# El '|| true' final no es decorativo: 'grep' devuelve 1 cuando no encuentra
+# nada, y con 'set -e' + 'pipefail' eso mata el script en un servidor recien
+# instalado, que es justo el caso normal (Docker sin ningun contenedor todavia).
+# Aqui "no hay puertos ocupados" es una respuesta valida, no un error.
 docker_used_ports() {
     docker_alive || return 0
     docker ps -a --format '{{.Ports}}' 2>/dev/null \
         | tr ',' '\n' \
         | grep -oE '(^|:)[0-9]+->' \
         | grep -oE '[0-9]+' \
-        | sort -un
+        | sort -un || true
 }
 
 # Puertos en escucha en el host (servicios nativos: Apache del sistema, MySQL
-# instalado a pelo, un panel de control...).
+# instalado a pelo, un panel de control...). Mismo motivo para el '|| true':
+# un servidor sin nada escuchando no es un fallo.
 host_used_ports() {
     if command -v ss >/dev/null 2>&1; then
-        ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un
+        ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un || true
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -ltn 2>/dev/null | awk 'NR>2 {print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un
+        netstat -ltn 2>/dev/null | awk 'NR>2 {print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un || true
     fi
 }
 
 # Cache de puertos ocupados: consultar Docker por cada puerto candidato es lento.
 USED_PORTS=""
 refresh_used_ports() {
-    USED_PORTS=$'\n'"$( { docker_used_ports; host_used_ports; } | sort -un )"$'\n'
+    USED_PORTS=$'\n'"$( { docker_used_ports; host_used_ports; } | sort -un || true )"$'\n'
 }
 
 port_free() {
@@ -848,9 +861,11 @@ phase_fetch_source() {
     flatten_single_dir
     detect_docroot
 
+    # Solo es un dato informativo: si 'find' tropieza con un directorio sin
+    # permisos no tiene sentido abortar un despliegue que ya ha ido bien.
     local files
-    files="$(find "$APP_DIR" -type f | wc -l)"
-    ok "Proyecto descargado: ${files} archivos en ${APP_DIR}"
+    files="$(find "$APP_DIR" -type f 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+    ok "Proyecto descargado: ${files:-0} archivos en ${APP_DIR}"
 }
 
 fetch_from_git() {
@@ -939,7 +954,9 @@ detect_docroot() {
         candidates+=("$dir")
     done < <(find "$APP_DIR" -mindepth 2 -maxdepth 3 -name 'index.php' -type f 2>/dev/null | sort)
 
-    mapfile -t candidates < <(printf '%s\n' "${candidates[@]:-}" | grep -v '^$' | awk '!seen[$0]++')
+    # Con el array vacio 'grep -v' no encuentra nada y devuelve 1: no es un
+    # error, solo significa que no hay ningun candidato que deduplicar.
+    mapfile -t candidates < <(printf '%s\n' "${candidates[@]:-}" | grep -v '^$' | awk '!seen[$0]++' || true)
 
     if (( ${#candidates[@]} == 0 )); then
         warn "No encontre ningun index.php. Se servira la raiz del proyecto."
@@ -1022,11 +1039,19 @@ phase_db_config() {
 
 gen_password() {
     # openssl esta en practicamente cualquier VPS; /dev/urandom es el respaldo.
+    local pw=""
     if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-24
-    else
-        tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
+        # 32 bytes en vez de 24: al quitar '/', '+' y '=' se pierden caracteres
+        # y con 24 el resultado podia quedarse corto.
+        pw="$(openssl rand -base64 32 2>/dev/null | tr -d '/+=\n' | cut -c1-24 || true)"
     fi
+    if (( ${#pw} < 16 )); then
+        # 'head -c' cierra la tuberia en cuanto tiene sus 24 bytes y 'tr' muere
+        # con SIGPIPE; con pipefail eso cuenta como fallo del script, de ahi el
+        # '|| true'. La contrasena ya se ha emitido cuando eso ocurre.
+        pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24 || true)"
+    fi
+    printf '%s' "$pw"
 }
 
 # Busca archivos que contengan patrones de conexion a MySQL. Se limita a los
@@ -1065,7 +1090,7 @@ find_config_candidates() {
         depth="${depth:-0}"
         score=$((score + matches * 5 - depth * 3))
         printf '%s\t%s\n' "$score" "$f"
-    done <<< "$hits" | sort -rn -k1,1 | cut -f2- | head -20
+    done <<< "$hits" | sort -rn -k1,1 | cut -f2- | head -20 || true
 }
 
 choose_config_file() {
@@ -1094,21 +1119,24 @@ extract_value() {
     local keys=("$@")
     local key value
 
+    # Cada busqueda lleva '|| true' porque lo habitual es que la clave NO este
+    # en ese formato concreto: grep devuelve 1, y sin el guarda 'set -e' daria
+    # el proyecto por fallido en vez de probar el formato siguiente.
     for key in "${keys[@]}"; do
         # define('DB_USER', 'valor');
-        value="$(grep -ioE "define[[:space:]]*\([[:space:]]*['\"]${key}['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")"
+        value="$(grep -ioE "define[[:space:]]*\([[:space:]]*['\"]${key}['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/" || true)"
         [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
 
         # $db_user = 'valor';
-        value="$(grep -ioE "[$]${key}[[:space:]]*=[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")"
+        value="$(grep -ioE "[$]${key}[[:space:]]*=[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/" || true)"
         [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
 
         # 'username' => 'valor'
-        value="$(grep -ioE "['\"]${key}['\"][[:space:]]*=>[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")"
+        value="$(grep -ioE "['\"]${key}['\"][[:space:]]*=>[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/" || true)"
         [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
 
         # DB_USER=valor   (formato .env, con o sin comillas)
-        value="$(grep -iE "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null | head -1 | sed -E "s/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^['\"]//; s/['\"][[:space:]]*$//")"
+        value="$(grep -iE "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null | head -1 | sed -E "s/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^['\"]//; s/['\"][[:space:]]*$//" || true)"
         [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
     done
     return 0
@@ -1119,9 +1147,9 @@ extract_from_function_call() {
     local file=$1
     local call args
 
-    call="$(grep -oE "(mysqli_connect|new[[:space:]]+mysqli)[[:space:]]*\([^)]*\)" "$file" 2>/dev/null | head -1)"
+    call="$(grep -oE "(mysqli_connect|new[[:space:]]+mysqli)[[:space:]]*\([^)]*\)" "$file" 2>/dev/null | head -1 || true)"
     if [[ -n "$call" ]]; then
-        mapfile -t args < <(printf '%s' "$call" | grep -oE "['\"][^'\"]*['\"]" | sed -E "s/^['\"]//; s/['\"]$//")
+        mapfile -t args < <(printf '%s' "$call" | grep -oE "['\"][^'\"]*['\"]" | sed -E "s/^['\"]//; s/['\"]$//" || true)
         [[ -z "$DB_HOST_RAW" && -n "${args[0]:-}" ]] && DB_HOST_RAW="${args[0]}"
         [[ -z "$DB_USER"     && -n "${args[1]:-}" ]] && DB_USER="${args[1]}"
         [[ -z "$DB_PASS"     && -n "${args[2]:-}" ]] && DB_PASS="${args[2]}"
@@ -1131,15 +1159,15 @@ extract_from_function_call() {
     # new PDO("mysql:host=X;dbname=Y", "usuario", "clave"): el DSN va primero y
     # el usuario y la clave detras, tambien posicionales.
     local pdo
-    pdo="$(grep -oE "new[[:space:]]+PDO[[:space:]]*\([^)]*\)" "$file" 2>/dev/null | head -1)"
+    pdo="$(grep -oE "new[[:space:]]+PDO[[:space:]]*\([^)]*\)" "$file" 2>/dev/null | head -1 || true)"
     if [[ -n "$pdo" ]]; then
-        mapfile -t args < <(printf '%s' "$pdo" | grep -oE "['\"][^'\"]*['\"]" | sed -E "s/^['\"]//; s/['\"]$//")
+        mapfile -t args < <(printf '%s' "$pdo" | grep -oE "['\"][^'\"]*['\"]" | sed -E "s/^['\"]//; s/['\"]$//" || true)
         [[ -z "$DB_USER" && -n "${args[1]:-}" ]] && DB_USER="${args[1]}"
         [[ -z "$DB_PASS" && -n "${args[2]:-}" ]] && DB_PASS="${args[2]}"
     fi
 
     local dsn
-    dsn="$(grep -oE "mysql:host=[^'\"]*" "$file" 2>/dev/null | head -1)"
+    dsn="$(grep -oE "mysql:host=[^'\"]*" "$file" 2>/dev/null | head -1 || true)"
     if [[ -n "$dsn" ]]; then
         [[ -z "$DB_HOST_RAW" ]] && DB_HOST_RAW="$(printf '%s' "$dsn" | sed -E 's/^mysql:host=([^;]*).*/\1/')"
         if [[ -z "$DB_NAME" && "$dsn" == *dbname=* ]]; then
@@ -1410,16 +1438,18 @@ php_needs_archive_repos() {
 }
 
 # Los paquetes de desarrollo y los flags de gd cambiaron en PHP 7.4.
+# La imagen de PHP 5.6 esta sobre Debian 9 (stretch), no sobre jessie: alli el
+# paquete de png ya es libpng-dev (libpng16), y libpng12-dev no existe.
 php_build_deps() {
     if [[ "$PHP_VERSION" == "5.6" ]]; then
-        printf 'libpng12-dev libjpeg-dev libfreetype6-dev zlib1g-dev'
+        printf 'libpng-dev libjpeg-dev libfreetype6-dev zlib1g-dev'
     else
         printf 'libpng-dev libjpeg-dev libfreetype6-dev libzip-dev libicu-dev libonig-dev'
     fi
 }
 
-# El metapaquete default-mysql-client no existe en Debian jessie, la base de la
-# imagen de PHP 5.6: alli el cliente todavia se llama mysql-client.
+# En Debian 9 (stretch), la base de la imagen de PHP 5.6, el cliente se sigue
+# llamando mysql-client; default-mysql-client llego despues.
 php_mysql_client_pkg() {
     if [[ "$PHP_VERSION" == "5.6" ]]; then
         printf 'mysql-client'
@@ -1457,13 +1487,21 @@ write_dockerfile() {
         printf 'FROM php:%s-%s\n\n' "$PHP_VERSION" "$base_tag"
 
         if php_needs_archive_repos; then
-            printf '# Debian archivo: los repositorios de esta version ya no estan en deb.debian.org.\n'
+            printf '# Repositorios de una version de Debian que puede estar ya archivada.\n'
+            printf '# No se da por hecho: se prueba el original y solo si falla se cambia a\n'
+            printf '# archive.debian.org. Bullseye (PHP 7.4) todavia responde hoy y dejara de\n'
+            printf '# hacerlo mas adelante; asi la imagen sigue construyendose igual.\n'
             printf 'RUN set -eux; \\\n'
-            printf '    sed -i -e "s|deb.debian.org|archive.debian.org|g" \\\n'
-            printf '           -e "s|security.debian.org|archive.debian.org|g" \\\n'
-            printf '           -e "/stretch-updates/d" -e "/buster-updates/d" -e "/jessie-updates/d" \\\n'
-            printf '           /etc/apt/sources.list; \\\n'
-            printf '    echo "Acquire::Check-Valid-Until false;" > /etc/apt/apt.conf.d/99no-check-valid\n\n'
+            printf '    if ! apt-get update -q; then \\\n'
+            printf '        sed -i -e "s|deb.debian.org|archive.debian.org|g" \\\n'
+            printf '               -e "s|security.debian.org|archive.debian.org|g" \\\n'
+            printf '               -e "/stretch-updates/d" -e "/buster-updates/d" \\\n'
+            printf '               -e "/jessie-updates/d" -e "/bullseye-updates/d" \\\n'
+            printf '               -e "s|^deb |deb [trusted=yes] |" \\\n'
+            printf '               /etc/apt/sources.list; \\\n'
+            printf '        echo "Acquire::Check-Valid-Until false;" > /etc/apt/apt.conf.d/99no-check-valid; \\\n'
+            printf '        apt-get update; \\\n'
+            printf '    fi\n\n'
         fi
 
         printf '# Dependencias de compilacion de las extensiones de PHP.\n'
@@ -1700,12 +1738,12 @@ case "${1:-}" in
     status)  docker compose ps ;;
     logs)    docker compose logs -f --tail 100 ${2:+"$2"} ;;
     shell)   docker compose exec "$(php_service)" bash ;;
-    db)      docker compose exec db sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD"' ;;
+    db)      docker compose exec db sh -c 'exec "$(command -v mariadb || command -v mysql)" -uroot -p"$MYSQL_ROOT_PASSWORD"' ;;
     backup)
         mkdir -p backups
         out="backups/${DB_NAME}-$(date +%Y%m%d-%H%M%S).sql.gz"
         docker compose exec -T db sh -c \
-            "exec mysqldump -uroot -p\"\$MYSQL_ROOT_PASSWORD\" --single-transaction --routines '${DB_NAME}'" \
+            "exec \"\$(command -v mariadb-dump || command -v mysqldump)\" -uroot -p\"\$MYSQL_ROOT_PASSWORD\" --single-transaction --routines '${DB_NAME}'" \
             | gzip > "$out"
         echo "Copia guardada en $out"
         ;;
@@ -1715,9 +1753,9 @@ case "${1:-}" in
         read -rp "Esto sobrescribe la base '${DB_NAME}'. Continuar? [s/N]: " a
         [[ "${a,,}" == "s" ]] || exit 0
         if [[ "$file" == *.gz ]]; then
-            gunzip -c "$file" | docker compose exec -T db sh -c "exec mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" '${DB_NAME}'"
+            gunzip -c "$file" | docker compose exec -T db sh -c "exec \"\$(command -v mariadb || command -v mysql)\" -uroot -p\"\$MYSQL_ROOT_PASSWORD\" '${DB_NAME}'"
         else
-            docker compose exec -T db sh -c "exec mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" '${DB_NAME}'" < "$file"
+            docker compose exec -T db sh -c "exec \"\$(command -v mariadb || command -v mysql)\" -uroot -p\"\$MYSQL_ROOT_PASSWORD\" '${DB_NAME}'" < "$file"
         fi
         echo "Restaurado."
         ;;
@@ -1746,7 +1784,26 @@ dc() {
 # Ejecuta un comando dentro de un servicio, sin TTY (para poder capturar salida).
 dexec() {
     local svc=$1; shift
-    dc exec -T "$svc" "$@"
+    # Sin '< /dev/null' el comando de dentro se queda con la entrada estandar.
+    # En un 'curl | bash' esa entrada es el propio script todavia sin leer.
+    dc exec -T "$svc" "$@" < /dev/null
+}
+
+# Comprueba que un proceso corre dentro de un servicio SIN depender de lo que
+# traiga la imagen: 'docker top' lee la tabla de procesos desde el host. En las
+# imagenes oficiales no se puede contar con 'pgrep': php:*-fpm no lo incluye, y
+# el de busybox (nginx:alpine) compara con la linea de comandos completa, asi
+# que 'pgrep -x nginx' no encuentra 'nginx: master process ...'.
+service_process() {
+    local svc=$1 pattern=$2 cid out
+    cid="$(dc ps -q "$svc" 2>/dev/null)" || return 1
+    [[ -n "$cid" ]] || return 1
+    # La tabla se guarda entera en vez de filtrarla con una tuberia: 'grep -q'
+    # cierra la salida en cuanto encuentra la linea, 'docker top' muere con
+    # SIGPIPE y con 'pipefail' la comprobacion falla a ratos aunque el proceso
+    # este perfectamente vivo.
+    out="$(docker top "$cid" 2>/dev/null)" || return 1
+    [[ "$out" == *"$pattern"* ]]
 }
 
 php_service_name() {
@@ -1813,13 +1870,13 @@ verify_services() {
     case "$WEB_ENGINE" in
         apache)
             check "Configuracion de Apache" dexec web apache2ctl -t || failed=1
-            check "Proceso apache2 en marcha" dexec web pgrep -x apache2 || failed=1
+            check "Proceso apache2 en marcha" service_process web apache2 || failed=1
             check "PHP ${PHP_VERSION} operativo" dexec web php -v || failed=1
             ;;
         nginx)
             check "Configuracion de Nginx" dexec web nginx -t || failed=1
-            check "Proceso nginx en marcha" dexec web pgrep -x nginx || failed=1
-            check "Proceso php-fpm en marcha" dexec php pgrep -f php-fpm || failed=1
+            check "Proceso nginx en marcha" service_process web nginx || failed=1
+            check "Proceso php-fpm en marcha" service_process php php-fpm || failed=1
             check "PHP ${PHP_VERSION} operativo" dexec php php -v || failed=1
             ;;
     esac
@@ -1858,7 +1915,7 @@ check() {
 db_query() {
     local sql=$1 database=${2:-}
     printf '%s\n' "$sql" | dc exec -T -e DEPLOYER_DB="$database" db sh -c \
-        'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" ${DEPLOYER_DB:+"$DEPLOYER_DB"} -N -B'
+        'exec "$(command -v mariadb || command -v mysql)" -uroot -p"$MYSQL_ROOT_PASSWORD" ${DEPLOYER_DB:+"$DEPLOYER_DB"} -N -B'
 }
 
 # Escapa un valor para meterlo entre comillas simples en una sentencia SQL. Las
@@ -1936,9 +1993,11 @@ grant_project_user() {
 # Ordenados por tamano: el volcado bueno casi siempre es el mas grande, y los
 # pequenos suelen ser migraciones sueltas o esquemas parciales.
 find_sql_files() {
+    # Que no haya volcados (o que 'find' se queje de un directorio) no es un
+    # fallo del despliegue: quien llama ya trata la lista vacia.
     find "$APP_DIR" -type f \( -iname '*.sql' -o -iname '*.sql.gz' \) \
         -not -path '*/vendor/*' -not -path '*/node_modules/*' -not -path '*/.git/*' \
-        -printf '%s\t%p\n' 2>/dev/null | sort -rn -k1,1 | cut -f2-
+        -printf '%s\t%p\n' 2>/dev/null | sort -rn -k1,1 | cut -f2- || true
 }
 
 human_size() {
@@ -2015,7 +2074,7 @@ import_sql_file() {
     # hay que hacerlo sobrevivir al entrecomillado del shell intermedio.
     local rc=0
     local -a mysql_run=(dc exec -T -e DEPLOYER_DB="$DB_NAME" db sh -c
-        'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --default-character-set=utf8mb4 "$DEPLOYER_DB"')
+        'exec "$(command -v mariadb || command -v mysql)" -uroot -p"$MYSQL_ROOT_PASSWORD" --default-character-set=utf8mb4 "$DEPLOYER_DB"')
 
     if [[ "$file" == *.gz ]]; then
         gunzip -c "$file" | "${mysql_run[@]}" || rc=$?
@@ -2039,7 +2098,9 @@ import_sql_file() {
 verify_import() {
     local tables rows
     local schema; schema="$(sql_quote "$DB_NAME")"
-    tables="$(db_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=${schema}" | tr -d '[:space:]')"
+    # Esto es una comprobacion, no un paso del despliegue: si la consulta falla
+    # se avisa, pero no se tira abajo una importacion que ya termino bien.
+    tables="$(db_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=${schema}" 2>/dev/null | tr -d '[:space:]' || true)"
 
     if [[ -z "$tables" || "$tables" == "0" ]]; then
         warn "La importacion termino sin errores pero la base '${DB_NAME}' no tiene ninguna tabla."
@@ -2120,7 +2181,9 @@ firewall_hint() {
 }
 
 detect_ips() {
-    LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    # 'hostname -I' no existe en todas las imagenes minimas: si falta, el
+    # respaldo de la linea siguiente ya deja 127.0.0.1.
+    LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     [[ -n "$LOCAL_IP" ]] || LOCAL_IP="127.0.0.1"
 
     # Varios servicios por si alguno esta caido o bloqueado desde el VPS.

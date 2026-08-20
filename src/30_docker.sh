@@ -24,13 +24,16 @@ phase_setup_docker() {
         # servicio no arranco al instalar la imagen del VPS.
         info "Docker esta instalado pero el demonio no responde. Intentando arrancarlo..."
         start_docker_daemon
-        docker_alive || die "El demonio de Docker no arranca. Revisa: systemctl status docker"
+        (( DRY_RUN )) || docker_alive || die "El demonio de Docker no arranca. Revisa: systemctl status docker"
         DOCKER_WAS_PRESENT=1
         ok "Demonio de Docker arrancado."
     else
         install_docker
         start_docker_daemon
-        docker_alive || die "Docker se instalo pero el demonio no responde. Revisa: systemctl status docker"
+        # En --dry-run no se ha instalado nada, asi que el demonio no puede
+        # responder: comprobarlo abortaria el simulacro en la fase 1 y las
+        # nueve fases restantes no llegarian a verse nunca.
+        (( DRY_RUN )) || docker_alive || die "Docker se instalo pero el demonio no responde. Revisa: systemctl status docker"
         ok "Docker instalado correctamente."
     fi
 
@@ -38,7 +41,7 @@ phase_setup_docker() {
         ok "Docker Compose disponible ($(docker compose version --short 2>/dev/null))."
     else
         install_compose_plugin
-        compose_alive || die "No se pudo instalar el plugin 'docker compose'."
+        (( DRY_RUN )) || compose_alive || die "No se pudo instalar el plugin 'docker compose'."
         ok "Plugin Docker Compose instalado."
     fi
 }

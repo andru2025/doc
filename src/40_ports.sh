@@ -10,29 +10,35 @@ PORT_PMA_BASE=8180
 # Puertos publicados por contenedores Docker, incluidos los parados: un
 # contenedor detenido reclama su puerto en cuanto alguien lo arranca, asi que
 # ignorarlos provocaria un choque mas adelante.
+#
+# El '|| true' final no es decorativo: 'grep' devuelve 1 cuando no encuentra
+# nada, y con 'set -e' + 'pipefail' eso mata el script en un servidor recien
+# instalado, que es justo el caso normal (Docker sin ningun contenedor todavia).
+# Aqui "no hay puertos ocupados" es una respuesta valida, no un error.
 docker_used_ports() {
     docker_alive || return 0
     docker ps -a --format '{{.Ports}}' 2>/dev/null \
         | tr ',' '\n' \
         | grep -oE '(^|:)[0-9]+->' \
         | grep -oE '[0-9]+' \
-        | sort -un
+        | sort -un || true
 }
 
 # Puertos en escucha en el host (servicios nativos: Apache del sistema, MySQL
-# instalado a pelo, un panel de control...).
+# instalado a pelo, un panel de control...). Mismo motivo para el '|| true':
+# un servidor sin nada escuchando no es un fallo.
 host_used_ports() {
     if command -v ss >/dev/null 2>&1; then
-        ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un
+        ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un || true
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -ltn 2>/dev/null | awk 'NR>2 {print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un
+        netstat -ltn 2>/dev/null | awk 'NR>2 {print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un || true
     fi
 }
 
 # Cache de puertos ocupados: consultar Docker por cada puerto candidato es lento.
 USED_PORTS=""
 refresh_used_ports() {
-    USED_PORTS=$'\n'"$( { docker_used_ports; host_used_ports; } | sort -un )"$'\n'
+    USED_PORTS=$'\n'"$( { docker_used_ports; host_used_ports; } | sort -un || true )"$'\n'
 }
 
 port_free() {

@@ -50,7 +50,11 @@ run() {
 detect_input() {
     if [[ -t 0 ]]; then
         TTY_IN=/dev/stdin
-    elif [[ -e /dev/tty ]] && (: >/dev/tty) 2>/dev/null; then
+    elif [[ -p /dev/stdin ]] && [[ -e /dev/tty ]] && (: >/dev/tty) 2>/dev/null; then
+        # Solo el caso 'curl | bash': stdin es una tuberia y el usuario sigue
+        # delante del terminal. Si stdin viene de /dev/null o de un fichero la
+        # intencion es un despliegue desatendido, y caer a /dev/tty dejaria el
+        # script colgado en la primera pregunta esperando a alguien que no esta.
         TTY_IN=/dev/tty
     else
         NONINTERACTIVE=1

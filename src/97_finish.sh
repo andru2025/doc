@@ -59,7 +59,9 @@ firewall_hint() {
 }
 
 detect_ips() {
-    LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    # 'hostname -I' no existe en todas las imagenes minimas: si falta, el
+    # respaldo de la linea siguiente ya deja 127.0.0.1.
+    LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     [[ -n "$LOCAL_IP" ]] || LOCAL_IP="127.0.0.1"
 
     # Varios servicios por si alguno esta caido o bloqueado desde el VPS.

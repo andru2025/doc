@@ -47,11 +47,19 @@ phase_db_config() {
 
 gen_password() {
     # openssl esta en practicamente cualquier VPS; /dev/urandom es el respaldo.
+    local pw=""
     if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-24
-    else
-        tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
+        # 32 bytes en vez de 24: al quitar '/', '+' y '=' se pierden caracteres
+        # y con 24 el resultado podia quedarse corto.
+        pw="$(openssl rand -base64 32 2>/dev/null | tr -d '/+=\n' | cut -c1-24 || true)"
     fi
+    if (( ${#pw} < 16 )); then
+        # 'head -c' cierra la tuberia en cuanto tiene sus 24 bytes y 'tr' muere
+        # con SIGPIPE; con pipefail eso cuenta como fallo del script, de ahi el
+        # '|| true'. La contrasena ya se ha emitido cuando eso ocurre.
+        pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24 || true)"
+    fi
+    printf '%s' "$pw"
 }
 
 # Busca archivos que contengan patrones de conexion a MySQL. Se limita a los
@@ -90,7 +98,7 @@ find_config_candidates() {
         depth="${depth:-0}"
         score=$((score + matches * 5 - depth * 3))
         printf '%s\t%s\n' "$score" "$f"
-    done <<< "$hits" | sort -rn -k1,1 | cut -f2- | head -20
+    done <<< "$hits" | sort -rn -k1,1 | cut -f2- | head -20 || true
 }
 
 choose_config_file() {
@@ -119,21 +127,24 @@ extract_value() {
     local keys=("$@")
     local key value
 
+    # Cada busqueda lleva '|| true' porque lo habitual es que la clave NO este
+    # en ese formato concreto: grep devuelve 1, y sin el guarda 'set -e' daria
+    # el proyecto por fallido en vez de probar el formato siguiente.
     for key in "${keys[@]}"; do
         # define('DB_USER', 'valor');
-        value="$(grep -ioE "define[[:space:]]*\([[:space:]]*['\"]${key}['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")"
+        value="$(grep -ioE "define[[:space:]]*\([[:space:]]*['\"]${key}['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/" || true)"
         [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
 
         # $db_user = 'valor';
-        value="$(grep -ioE "[$]${key}[[:space:]]*=[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")"
+        value="$(grep -ioE "[$]${key}[[:space:]]*=[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/" || true)"
         [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
 
         # 'username' => 'valor'
-        value="$(grep -ioE "['\"]${key}['\"][[:space:]]*=>[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")"
+        value="$(grep -ioE "['\"]${key}['\"][[:space:]]*=>[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null | head -1 | sed -E "s/.*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/" || true)"
         [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
 
         # DB_USER=valor   (formato .env, con o sin comillas)
-        value="$(grep -iE "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null | head -1 | sed -E "s/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^['\"]//; s/['\"][[:space:]]*$//")"
+        value="$(grep -iE "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null | head -1 | sed -E "s/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^['\"]//; s/['\"][[:space:]]*$//" || true)"
         [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
     done
     return 0
@@ -144,9 +155,9 @@ extract_from_function_call() {
     local file=$1
     local call args
 
-    call="$(grep -oE "(mysqli_connect|new[[:space:]]+mysqli)[[:space:]]*\([^)]*\)" "$file" 2>/dev/null | head -1)"
+    call="$(grep -oE "(mysqli_connect|new[[:space:]]+mysqli)[[:space:]]*\([^)]*\)" "$file" 2>/dev/null | head -1 || true)"
     if [[ -n "$call" ]]; then
-        mapfile -t args < <(printf '%s' "$call" | grep -oE "['\"][^'\"]*['\"]" | sed -E "s/^['\"]//; s/['\"]$//")
+        mapfile -t args < <(printf '%s' "$call" | grep -oE "['\"][^'\"]*['\"]" | sed -E "s/^['\"]//; s/['\"]$//" || true)
         [[ -z "$DB_HOST_RAW" && -n "${args[0]:-}" ]] && DB_HOST_RAW="${args[0]}"
         [[ -z "$DB_USER"     && -n "${args[1]:-}" ]] && DB_USER="${args[1]}"
         [[ -z "$DB_PASS"     && -n "${args[2]:-}" ]] && DB_PASS="${args[2]}"
@@ -156,15 +167,15 @@ extract_from_function_call() {
     # new PDO("mysql:host=X;dbname=Y", "usuario", "clave"): el DSN va primero y
     # el usuario y la clave detras, tambien posicionales.
     local pdo
-    pdo="$(grep -oE "new[[:space:]]+PDO[[:space:]]*\([^)]*\)" "$file" 2>/dev/null | head -1)"
+    pdo="$(grep -oE "new[[:space:]]+PDO[[:space:]]*\([^)]*\)" "$file" 2>/dev/null | head -1 || true)"
     if [[ -n "$pdo" ]]; then
-        mapfile -t args < <(printf '%s' "$pdo" | grep -oE "['\"][^'\"]*['\"]" | sed -E "s/^['\"]//; s/['\"]$//")
+        mapfile -t args < <(printf '%s' "$pdo" | grep -oE "['\"][^'\"]*['\"]" | sed -E "s/^['\"]//; s/['\"]$//" || true)
         [[ -z "$DB_USER" && -n "${args[1]:-}" ]] && DB_USER="${args[1]}"
         [[ -z "$DB_PASS" && -n "${args[2]:-}" ]] && DB_PASS="${args[2]}"
     fi
 
     local dsn
-    dsn="$(grep -oE "mysql:host=[^'\"]*" "$file" 2>/dev/null | head -1)"
+    dsn="$(grep -oE "mysql:host=[^'\"]*" "$file" 2>/dev/null | head -1 || true)"
     if [[ -n "$dsn" ]]; then
         [[ -z "$DB_HOST_RAW" ]] && DB_HOST_RAW="$(printf '%s' "$dsn" | sed -E 's/^mysql:host=([^;]*).*/\1/')"
         if [[ -z "$DB_NAME" && "$dsn" == *dbname=* ]]; then
