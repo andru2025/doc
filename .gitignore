@@ -1,0 +1,14 @@
+# Salida de tests/gen-artifacts.sh cuando se le pasa un directorio local
+/artifacts/
+/tmp/
+
+# Restos de edicion
+*.bak
+*.orig
+*.rej
+*~
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,8 @@
+# El artefacto se descarga con curl y se ejecuta con bash en un VPS Linux.
+# Si git convirtiera los saltos de linea a CRLF, bash fallaria alli con
+# "bad interpreter: No such file or directory". Se fuerza LF siempre.
+* text=auto eol=lf
+
+*.sh  text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
